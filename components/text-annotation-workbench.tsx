@@ -40,7 +40,7 @@ import {
   Wifi,
   WifiOff
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
 import {
   STORAGE_KEY,
@@ -55,6 +55,14 @@ import {
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  buildFootnoteIndex,
+  entriesAt,
+  entriesInChapter,
+  findAnnotationLocation,
+  pruneDanglingReferences
+} from '@/lib/footnotes';
+import type { FootnoteEntry, FootnoteIndex } from '@/lib/footnotes';
 import type {
   Annotation,
   AnnotationKind,
@@ -67,9 +75,9 @@ import type {
 } from '@/lib/types';
 
 const MODE_COPY: Record<ViewMode, { label: string; hint: string }> = {
-  reading: { label: '阅读版', hint: '只读正文，脚注按引用编号展开' },
-  editing: { label: '编辑版', hint: '选择章节、句子或词语并维护注释' },
-  critical: { label: '校勘版', hint: '逐句对照来源、异文与争议内容' }
+  reading: { label: '阅读版', hint: '只读正文，全局脚注号按正文出现顺序连续标注，文末可互跳' },
+  editing: { label: '编辑版', hint: '选择章节、句子或词语并维护注释，编号随改随算' },
+  critical: { label: '校勘版', hint: '逐句对照来源、异文与争议内容，编号仍为当前稿全局序号' }
 };
 
 const kindColors: Record<AnnotationKind, 'primary' | 'warning' | 'secondary' | 'success'> = {
@@ -98,43 +106,167 @@ function escapeHtml(value: string) {
     .replaceAll("'", '&#039;');
 }
 
+function refMarkup(number: number) {
+  return `<a class="fn-ref" href="#fn-${number}">${number}</a>`;
+}
+
+/**
+ * 导出稿与阅读窗口共用同一套全局脚注号（buildFootnoteIndex 按正文顺序算出）：
+ * 正文标记、文末条目、互见编号全部取该索引，互见渲染为可跳转链接。
+ */
 function buildHtml(document: TextDocument) {
+  const index = buildFootnoteIndex(document);
+
+  const markAt = (anchorId: string) =>
+    entriesAt(index, anchorId)
+      .map((entry) => `<a class="fn-ref" id="fnref-${entry.number}" href="#fn-${entry.number}">${entry.number}</a>`)
+      .join('');
+
   const sections = document.chapters
     .map((chapter) => {
+      const chapterMarks = markAt(chapter.id);
+      const chapterHead = chapterMarks ? `<p class="summary">${escapeHtml(chapter.summary)} <sup>${chapterMarks}</sup></p>` : `<p class="summary">${escapeHtml(chapter.summary)}</p>`;
       const sentences = chapter.sentences
         .map((sentence) => {
-          const notes = document.annotations.filter(
-            (annotation) => annotation.anchorId === sentence.id && annotation.anchorType === 'sentence'
-          );
-          const suffix = notes
-            .map((annotation) => `<sup title="${escapeHtml(annotation.title)}">[${escapeHtml(annotation.source)}]</sup>`)
-            .join('');
-          return `<p id="${escapeHtml(sentence.id)}">${escapeHtml(sentence.text)}${suffix}</p>`;
+          // 以 token 为粒度切分，词级注释标记挂在词后，句级标记收在句末；同号只输出一次。
+          let html = '';
+          for (const token of sentence.tokens) {
+            html += escapeHtml(token.text);
+            const wordMarks = markAt(token.id);
+            if (wordMarks) html += `<sup>${wordMarks}</sup>`;
+          }
+          const sentenceMarks = markAt(sentence.id);
+          if (sentenceMarks) html += `<sup>${sentenceMarks}</sup>`;
+          return `<p id="${escapeHtml(sentence.id)}">${html}</p>`;
         })
         .join('\n');
-      return `<section><h2>${escapeHtml(chapter.title)}</h2><p class="summary">${escapeHtml(chapter.summary)}</p>${sentences}</section>`;
+      return `<section id="chapter-${escapeHtml(chapter.id)}"><h2>${escapeHtml(chapter.title)}</h2>${chapterHead}${sentences}</section>`;
     })
     .join('\n');
 
-  const notes = document.annotations
-    .map(
-      (annotation) =>
-        `<li><b>${escapeHtml(annotation.title)}</b> <span>${escapeHtml(annotation.source)}</span><br>${escapeHtml(annotation.body)}</li>`
-    )
+  // 文末条目按全局号顺序排列，互见显示所引编号并带跳转；无着注释单列，不留断链。
+  const notes = index.entries
+    .map((entry) => {
+      const refs = entry.annotation.references
+        .map((referenceId) => index.byId.get(referenceId))
+        .filter((item): item is NonNullable<typeof item> => Boolean(item))
+        .map((item) => refMarkup(item.number))
+        .join(' ');
+      const missing = entry.annotation.references.filter((referenceId) => !index.byId.has(referenceId)).length;
+      const crossref = refs
+        ? `<br><span class="crossref">互见：${refs}${missing ? ' <i>（另含已失效引用，已跳过）</i>' : ''}</span>`
+        : '';
+      return `<li id="fn-${entry.number}"><b>${escapeHtml(entry.annotation.title)}</b> <span class="kind">[${escapeHtml(kindLabel(entry.annotation.kind))} · ${escapeHtml(entry.annotation.source)}]</span>${entry.orphaned ? ' <span class="orphan">【无着注释】</span>' : ''}<br>${escapeHtml(entry.annotation.body)}${crossref} <a class="backref" href="#fnref-${entry.number}">↩</a></li>`;
+    })
     .join('\n');
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(document.title)}</title>
-<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}</style></head>
+<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}sup{font-size:.68em}.fn-ref{color:#b45309;text-decoration:none;font-weight:700;margin:0 1px}.fn-ref:hover{text-decoration:underline}ol.notes{padding-left:1.6em}ol.notes li{margin:.8em 0;scroll-margin-top:96px}.kind{color:#8a8275;font-size:.86em;font-weight:400}.crossref{color:#15803d}.crossref a{color:#15803d}.orphan{color:#b91c1c;font-size:.86em}.backref{color:#b45309;text-decoration:none;margin-left:.3em}small{color:#777}</style></head>
 <body><h1>${escapeHtml(document.title)}</h1><p style="text-align:center">${escapeHtml(document.author)} · ${escapeHtml(document.edition)}</p>
-${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
+${sections}<hr><h2>注释与校记</h2><p><small>编号按正文出现顺序全局连续排列；同一条注释只占一个号，互见编号可点击跳转。共 ${index.entries.length} 条，其中无着注释 ${index.entries.filter((entry) => entry.orphaned).length} 条。</small></p><ol class="notes">${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
 }
 
-function sentenceAnnotationCount(document: TextDocument, sentence: Sentence) {
-  return document.annotations.filter(
-    (annotation) =>
-      annotation.anchorId === sentence.id ||
-      sentence.tokens.some((token) => token.id === annotation.anchorId)
-  ).length;
+interface FootnoteMarksProps {
+  entries: FootnoteEntry[];
+  selectedId: string | null;
+  onSelect: (annotationId: string) => void;
+}
+
+/** 正文里的全局脚注角标：每个号一个可点击按钮，与文末条目一一对应。 */
+function FootnoteMarks({ entries, selectedId, onSelect }: FootnoteMarksProps) {
+  if (!entries.length) return null;
+  return (
+    <sup className="mx-0.5 inline-flex select-none gap-0.5 align-super">
+      {entries.map((entry) => (
+        <button
+          key={entry.annotation.id}
+          id={`marker-${entry.annotation.id}`}
+          type="button"
+          data-footnote-number={entry.number}
+          aria-label={`跳转到第 ${entry.number} 条注释：${entry.annotation.title}`}
+          className={`footnote-mark ${selectedId === entry.annotation.id ? 'footnote-mark-active' : ''}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect(entry.annotation.id);
+          }}
+        >
+          {entry.number}
+        </button>
+      ))}
+    </sup>
+  );
+}
+
+interface FootnoteItemProps {
+  entry: FootnoteEntry;
+  index: ReturnType<typeof buildFootnoteIndex>;
+  selected: boolean;
+  onSelect: () => void;
+  onJumpRef: (annotationId: string) => void;
+  onBack: (() => void) | null;
+}
+
+/** 阅读窗口/打印稿中的脚注条目：编号与正文角标一致，互见显示所引编号并可跳转。 */
+function FootnoteItem({ entry, index, selected, onSelect, onJumpRef, onBack }: FootnoteItemProps) {
+  const annotation = entry.annotation;
+  const referencedEntries = annotation.references
+    .map((referenceId) => index.byId.get(referenceId))
+    .filter((item): item is FootnoteEntry => Boolean(item));
+  const missingCount = annotation.references.filter((referenceId) => !index.byId.has(referenceId)).length;
+
+  return (
+    <li
+      id={`footnote-entry-${annotation.id}`}
+      className={`footnote-item rounded-lg border px-3 py-2 ${
+        selected ? 'border-amber-400 bg-amber-50/70' : entry.orphaned ? 'border-red-200 bg-red-50/40' : 'border-stone-200 bg-white'
+      }`}
+    >
+      <div className="flex items-start gap-2.5">
+        <span className="mt-0.5 grid h-6 min-w-6 shrink-0 place-items-center rounded-full bg-amber-600 px-1.5 text-xs font-bold text-white">
+          {entry.number}
+        </span>
+        <div className="min-w-0 flex-1 text-sm leading-6 text-stone-700">
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" className="text-left font-semibold text-stone-900 hover:text-amber-800" onClick={onSelect}>
+              {annotation.title}
+            </button>
+            <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">{kindLabel(annotation.kind)}</Chip>
+            <span className="text-xs text-stone-500">{annotation.source}</span>
+            {entry.orphaned ? <Chip size="sm" color="danger" variant="bordered">无着注释 · 锚点缺失</Chip> : null}
+          </div>
+          <p className="mt-1">{annotation.body}</p>
+          {referencedEntries.length ? (
+            <p className="mt-1.5 flex flex-wrap items-center gap-1 text-xs text-green-700">
+              <Link2 className="h-3 w-3" />互见：
+              {referencedEntries.map((refEntry) => (
+                <button
+                  key={refEntry.annotation.id}
+                  type="button"
+                  className="rounded-full border border-green-200 bg-green-50 px-2 py-0.5 font-semibold hover:border-green-500"
+                  title={`跳转到第 ${refEntry.number} 条：${refEntry.annotation.title}`}
+                  onClick={() => onJumpRef(refEntry.annotation.id)}
+                >
+                  →{refEntry.number}
+                </button>
+              ))}
+              {missingCount ? <span className="text-red-500">（{missingCount} 条失效引用已忽略）</span> : null}
+            </p>
+          ) : null}
+        </div>
+        {onBack ? (
+          <button
+            type="button"
+            aria-label="回到正文标记"
+            title="回到正文标记"
+            className="shrink-0 rounded p-1 text-amber-700 hover:bg-amber-100"
+            onClick={onBack}
+          >
+            <ChevronRight className="h-4 w-4 rotate-180" />
+          </button>
+        ) : null}
+      </div>
+    </li>
+  );
 }
 
 function nextSentence(document: TextDocument, currentId: string) {
@@ -230,10 +362,11 @@ function AnnotationForm({ anchorId, anchorType, anchorPreview, onSubmit }: Annot
         <Input label="标签" value={tags} onValueChange={setTags} placeholder="地理, 异文" />
       </div>
       <Input
-        label="引用注释 ID"
+        label="互见注释（编号或 ID，逗号分隔）"
         value={references}
         onValueChange={setReferences}
-        placeholder="annotation-1, annotation-3"
+        placeholder="如：3 或 annotation-2"
+        description="按全局脚注号互见；保存后显示为可跳转编号。"
         startContent={<Link2 className="h-4 w-4 text-stone-400" />}
       />
       {error ? <p className="text-xs text-red-600">{error}</p> : null}
@@ -247,13 +380,15 @@ function AnnotationForm({ anchorId, anchorType, anchorPreview, onSubmit }: Annot
 interface AnnotationCardProps {
   annotation: Annotation;
   document: TextDocument;
+  index: FootnoteIndex;
   selected: boolean;
   onSelect: () => void;
   onUpdate: (patch: Partial<Annotation>) => void;
   onDelete: () => void;
+  onJumpRef: (annotationId: string) => void;
 }
 
-function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, onDelete }: AnnotationCardProps) {
+function AnnotationCard({ annotation, document, index, selected, onSelect, onUpdate, onDelete, onJumpRef }: AnnotationCardProps) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(annotation.title);
   const [body, setBody] = useState(annotation.body);
@@ -265,8 +400,14 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
     setSource(annotation.source);
   }, [annotation.id, annotation.title, annotation.body, annotation.source]);
 
+  const ownEntry = index.byId.get(annotation.id);
+  const referencedEntries = annotation.references
+    .map((referenceId) => index.byId.get(referenceId))
+    .filter((item): item is FootnoteEntry => Boolean(item));
+
   return (
     <Card
+      data-footnote-id={annotation.id}
       shadow="none"
       className={`border ${selected ? 'border-amber-500 bg-amber-50/60' : 'border-stone-200 bg-white'}`}
     >
@@ -275,6 +416,11 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
           <div className="flex items-start justify-between gap-2">
             <div>
               <div className="flex items-center gap-2">
+                {ownEntry ? (
+                  <span className="grid h-6 min-w-6 place-items-center rounded-full bg-amber-600 px-1.5 text-[11px] font-bold text-white">
+                    {ownEntry.number}
+                  </span>
+                ) : null}
                 <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">
                   {kindLabel(annotation.kind)}
                 </Chip>
@@ -309,8 +455,24 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
         ) : (
           <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
             <span>{getTargetLabel(document, annotation)}</span>
-            {annotation.references.length ? (
-              <span className="flex items-center gap-1"><Link2 className="h-3 w-3" />引用 {annotation.references.length} 条</span>
+            {referencedEntries.length ? (
+              <span className="flex flex-wrap items-center gap-1">
+                <Link2 className="h-3 w-3" />互见
+                {referencedEntries.map((entry) => (
+                  <button
+                    key={entry.number}
+                    type="button"
+                    className="rounded-full border border-green-200 bg-green-50 px-2 py-0.5 font-semibold text-green-700 hover:border-green-400"
+                    title={`跳转到第 ${entry.number} 条：${entry.annotation.title}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onJumpRef(entry.annotation.id);
+                    }}
+                  >
+                    {entry.number}
+                  </button>
+                ))}
+              </span>
             ) : null}
             <span className="ml-auto flex gap-1">
               <Button isIconOnly size="sm" variant="light" aria-label="编辑注释" onPress={() => setEditing(true)}>
@@ -340,6 +502,7 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -349,6 +512,13 @@ export function TextAnnotationWorkbench() {
   const selectedSentence = getSentence(document, workspace.selectedSentenceId);
   const conflicts = useMemo(() => getConflictGroups(document), [document]);
   const searchResults = useMemo(() => collectSearchResults(document, workspace.query), [document, workspace.query]);
+  // 正文标记、阅读窗口、导出稿共用同一份全局脚注编号；文档一变（改正文、撤销重做、恢复版本）立即重算。
+  const footnoteIndex = useMemo(() => buildFootnoteIndex(document), [document]);
+  const chapterEntries = useMemo(
+    () => (selectedChapter ? entriesInChapter(footnoteIndex, selectedChapter.id) : []),
+    [footnoteIndex, selectedChapter]
+  );
+  const orphanEntries = footnoteIndex.entries.filter((entry) => entry.orphaned);
 
   const anchor = pendingAnchor ?? {
     id: selectedSentence?.id ?? selectedChapter?.id ?? '',
@@ -403,24 +573,115 @@ export function TextAnnotationWorkbench() {
     });
   }, [selectedChapter?.id, selectedSentence?.id]);
 
-  const moveToNextAnnotation = useCallback(() => {
-    if (!document.annotations.length) return;
-    const currentIndex = document.annotations.findIndex((item) => item.id === workspace.selectedAnnotationId);
-    const next = document.annotations[(currentIndex + 1) % document.annotations.length];
-    dispatch({ type: 'selectAnnotation', annotationId: next.id });
-    for (const chapter of document.chapters) {
-      const sentence = chapter.sentences.find((item) => item.id === next.anchorId);
-      if (sentence) {
-        dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: sentence.id });
-        break;
+  const scrollIntoViewWithFlash = useCallback((element: HTMLElement | null) => {
+    if (!element) return;
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    element.classList.remove('footnote-flash');
+    // 强制重排，保证连续跳转同一目标时动画重新触发。
+    void element.offsetWidth;
+    element.classList.add('footnote-flash');
+    window.setTimeout(() => element.classList.remove('footnote-flash'), 1600);
+  }, []);
+
+  /**
+   * 互见/编号跳转：定位所引注释在当前稿中的位置，必要时先切换章节，
+   * 再滚到该条注释并闪烁。当前稿重算后目标始终可解析，不会断链。
+   */
+  const jumpToAnnotation = useCallback(
+    (annotationId: string) => {
+      const annotation = document.annotations.find((item) => item.id === annotationId);
+      if (!annotation) return;
+      const location = findAnnotationLocation(document, annotation);
+      dispatch({ type: 'selectAnnotation', annotationId });
+      setRightTab('annotations');
+
+      const scrollToTarget = () => {
+        const entryElement = window.document.getElementById(`footnote-entry-${annotationId}`);
+        const markerElement = window.document.getElementById(`marker-${annotationId}`);
+        scrollIntoViewWithFlash(entryElement ?? markerElement);
+      };
+
+      const needsChapterSwitch =
+        location.orphaned || location.chapterId !== workspace.selectedChapterId;
+      if (needsChapterSwitch) {
+        if (location.sentenceId) {
+          dispatch({ type: 'selectSentence', chapterId: location.chapterId, sentenceId: location.sentenceId });
+        } else {
+          dispatch({ type: 'selectChapter', chapterId: location.chapterId });
+        }
+        setPendingJumpId(annotationId);
+      } else if (location.sentenceId && location.sentenceId !== workspace.selectedSentenceId) {
+        dispatch({ type: 'selectSentence', chapterId: location.chapterId, sentenceId: location.sentenceId });
+        setPendingJumpId(annotationId);
+      } else {
+        scrollToTarget();
       }
-      const wordSentence = chapter.sentences.find((item) => item.tokens.some((token) => token.id === next.anchorId));
-      if (wordSentence) {
-        dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: wordSentence.id });
-        break;
-      }
+    },
+    [document, scrollIntoViewWithFlash, workspace.selectedChapterId, workspace.selectedSentenceId]
+  );
+
+  // 章节切换导致正文/注释窗口重挂后，再滚动到待跳转目标。
+  useEffect(() => {
+    if (!pendingJumpId) return;
+    const annotation = document.annotations.find((item) => item.id === pendingJumpId);
+    if (!annotation) {
+      setPendingJumpId(null);
+      return;
     }
-  }, [document, workspace.selectedAnnotationId]);
+    const location = findAnnotationLocation(document, annotation);
+    if (location.chapterId !== workspace.selectedChapterId) return;
+    const timer = window.setTimeout(() => {
+      const entryElement = window.document.getElementById(`footnote-entry-${pendingJumpId}`);
+      const markerElement = window.document.getElementById(`marker-${pendingJumpId}`);
+      scrollIntoViewWithFlash(entryElement ?? markerElement);
+      setPendingJumpId(null);
+    }, 60);
+    return () => window.clearTimeout(timer);
+  }, [pendingJumpId, document, workspace.selectedChapterId, scrollIntoViewWithFlash]);
+
+  const jumpBackToAnchor = useCallback(
+    (annotationId: string) => {
+      const annotation = document.annotations.find((item) => item.id === annotationId);
+      if (!annotation) return;
+      const location = findAnnotationLocation(document, annotation);
+      const chapterChanged = location.chapterId !== workspace.selectedChapterId;
+      if (chapterChanged) {
+        if (location.sentenceId) {
+          dispatch({ type: 'selectSentence', chapterId: location.chapterId, sentenceId: location.sentenceId });
+        } else {
+          dispatch({ type: 'selectChapter', chapterId: location.chapterId });
+        }
+      } else if (location.sentenceId && location.sentenceId !== workspace.selectedSentenceId) {
+        dispatch({ type: 'selectSentence', chapterId: location.chapterId, sentenceId: location.sentenceId });
+      }
+      dispatch({ type: 'selectAnnotation', annotationId });
+      const delay = chapterChanged ? 90 : 0;
+      window.setTimeout(
+        () => scrollIntoViewWithFlash(window.document.getElementById(`marker-${annotationId}`)),
+        delay
+      );
+    },
+    [document, scrollIntoViewWithFlash, workspace.selectedChapterId, workspace.selectedSentenceId]
+  );
+
+  const stepAnnotation = useCallback(
+    (direction: 1 | -1) => {
+      const ordered = footnoteIndex.entries;
+      if (!ordered.length) return;
+      const currentIndex = ordered.findIndex((entry) => entry.annotation.id === workspace.selectedAnnotationId);
+      const nextIndex =
+        currentIndex < 0
+          ? direction === 1
+            ? 0
+            : ordered.length - 1
+          : (currentIndex + direction + ordered.length) % ordered.length;
+      const target = ordered[nextIndex];
+      jumpToAnnotation(target.annotation.id);
+    },
+    [footnoteIndex, workspace.selectedAnnotationId, jumpToAnnotation]
+  );
+
+  const moveToNextAnnotation = useCallback(() => stepAnnotation(1), [stepAnnotation]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -444,10 +705,7 @@ export function TextAnnotationWorkbench() {
       } else if (event.key.toLowerCase() === 'j') {
         moveToNextAnnotation();
       } else if (event.key.toLowerCase() === 'k') {
-        if (!document.annotations.length) return;
-        const currentIndex = document.annotations.findIndex((item) => item.id === workspace.selectedAnnotationId);
-        const previous = document.annotations[(currentIndex - 1 + document.annotations.length) % document.annotations.length];
-        dispatch({ type: 'selectAnnotation', annotationId: previous.id });
+        stepAnnotation(-1);
       } else if (event.altKey && ['1', '2', '3'].includes(event.key)) {
         const mode = ({ '1': 'reading', '2': 'editing', '3': 'critical' } as const)[event.key as '1' | '2' | '3'];
         dispatch({ type: 'setMode', mode });
@@ -461,7 +719,7 @@ export function TextAnnotationWorkbench() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [document, moveToNextAnnotation, selectedSentence, workspace.selectedAnnotationId]);
+  }, [document, moveToNextAnnotation, stepAnnotation, selectedSentence]);
 
   async function persistSnapshot(reason: string) {
     setApiMessage('正在调用模拟保存接口…');
@@ -471,14 +729,36 @@ export function TextAnnotationWorkbench() {
     setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
   }
 
+  function resolveReferenceTokens(tokens: string[]): string[] {
+    const resolved: string[] = [];
+    for (const token of tokens) {
+      const trimmed = token.trim();
+      if (!trimmed) continue;
+      const direct = document.annotations.find((item) => item.id === trimmed);
+      if (direct) {
+        if (!resolved.includes(direct.id)) resolved.push(direct.id);
+        continue;
+      }
+      // 允许直接填全局脚注号（如“3”），按当前稿解析回稳定 ID。
+      const asNumber = Number(trimmed);
+      const entry = Number.isInteger(asNumber)
+        ? footnoteIndex.entries.find((item) => item.number === asNumber)
+        : undefined;
+      if (entry && !resolved.includes(entry.annotation.id)) resolved.push(entry.annotation.id);
+    }
+    return resolved;
+  }
+
   function addAnnotation(values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) {
     const id = `annotation-${Date.now().toString(36)}`;
+    const references = resolveReferenceTokens(values.references);
     dispatch({
       type: 'commit',
       label: '新增注释',
       mutate: (doc) => {
         doc.annotations.push({
           ...values,
+          references,
           id,
           status: 'open',
           conflictState: 'open',
@@ -570,15 +850,20 @@ export function TextAnnotationWorkbench() {
 
   function restoreVersion(versionId: string) {
     const version = document.snapshots.find((item) => item.id === versionId);
-    if (!version || !window.confirm(`将“${version.label}”恢复为当前草稿？`)) return;
+    if (!version || !window.confirm(`将“${version.label}”恢复为当前草稿？编号将按恢复后的正文重算。`)) return;
+    let pruned = 0;
     dispatch({
       type: 'commit',
       label: `恢复版本：${version.label}`,
       mutate: (doc) => {
         doc.chapters = clone(version.chapters);
         doc.annotations = clone(version.annotations);
+        // 旧版本中的互见可能指向已不存在的注释，重算前先清掉，杜绝断链。
+        pruned = pruneDanglingReferences(doc);
       }
     });
+    setPendingJumpId(null);
+    if (pruned) setApiMessage(`已恢复“${version.label}”，并清理 ${pruned} 条失效互见引用`);
   }
 
   const comparison = useMemo(() => {
@@ -788,7 +1073,16 @@ export function TextAnnotationWorkbench() {
               <div>
                 <div className="text-xs uppercase tracking-[0.24em] text-amber-700">Chapter {selectedChapter?.order}</div>
                 <h2 className="mt-1 font-serif text-3xl font-bold text-stone-900">{selectedChapter?.title}</h2>
-                <p className="mt-1 text-sm text-stone-500">{selectedChapter?.summary}</p>
+                <p className="mt-1 text-sm text-stone-500">
+                  {selectedChapter?.summary}
+                  {selectedChapter ? (
+                    <FootnoteMarks
+                      entries={entriesAt(footnoteIndex, selectedChapter.id)}
+                      selectedId={workspace.selectedAnnotationId}
+                      onSelect={jumpToAnnotation}
+                    />
+                  ) : null}
+                </p>
               </div>
               <div className="ml-auto flex flex-wrap justify-end gap-2">
                 <Chip variant="flat" color="warning">{conflicts.length} 处待解冲突</Chip>
@@ -802,10 +1096,9 @@ export function TextAnnotationWorkbench() {
             <CardBody className="px-5 py-7 sm:px-9">
               <div className="mx-auto max-w-4xl space-y-5">
                 {selectedChapter?.sentences.map((sentence) => {
-                  const sentenceAnnotations = document.annotations.filter(
-                    (annotation) =>
-                      annotation.anchorId === sentence.id ||
-                      sentence.tokens.some((token) => token.id === annotation.anchorId)
+                  const sentenceAnchorEntries = entriesAt(footnoteIndex, sentence.id);
+                  const sentenceEntries = footnoteIndex.entries.filter(
+                    (entry) => entry.sentenceId === sentence.id
                   );
                   const active = selectedSentence?.id === sentence.id;
                   return (
@@ -813,7 +1106,7 @@ export function TextAnnotationWorkbench() {
                       key={sentence.id}
                       id={sentence.id}
                       tabIndex={0}
-                      aria-label={`${selectedChapter.title}第${sentence.order}句，${sentenceAnnotationCount(document, sentence)}条注释`}
+                      aria-label={`${selectedChapter.title}第${sentence.order}句，${sentenceEntries.length}条注释`}
                       className={`group rounded-2xl border p-4 transition focus-ring ${
                         active ? 'border-amber-300 bg-white shadow-sm' : 'border-transparent hover:border-stone-200 hover:bg-white/70'
                       }`}
@@ -839,59 +1132,69 @@ export function TextAnnotationWorkbench() {
                           ) : (
                             <p className="font-serif text-xl leading-[2.1] text-stone-850">
                               {sentence.tokens.map((token) => {
-                                const tokenAnnotations = document.annotations.filter((annotation) => annotation.anchorId === token.id);
-                                if (!token.text.trim()) return <span key={token.id}>{token.text}</span>;
+                                const wordEntries = entriesAt(footnoteIndex, token.id);
+                                if (!token.text.trim()) {
+                                  return <span key={token.id}>{token.text}</span>;
+                                }
                                 return (
-                                  <button
-                                    key={token.id}
-                                    type="button"
-                                    className={`focus-ring rounded ${tokenAnnotations.length ? 'annotation-anchor' : 'hover:bg-amber-50'}`}
-                                    aria-label={`${token.text}，${tokenAnnotations.length}条词语注释`}
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      setPendingAnchor({ id: token.id, type: 'word', preview: token.text });
-                                      dispatch({ type: 'selectSentence', chapterId: selectedChapter.id, sentenceId: sentence.id });
-                                      if (tokenAnnotations[0]) dispatch({ type: 'selectAnnotation', annotationId: tokenAnnotations[0].id });
-                                    }}
-                                  >
-                                    {token.text}
-                                    {tokenAnnotations.length ? <sup className="ml-0.5 text-[10px] text-orange-700">{tokenAnnotations.length}</sup> : null}
-                                  </button>
+                                  <span key={token.id} className="inline-flex items-baseline">
+                                    <button
+                                      type="button"
+                                      className={`focus-ring rounded ${wordEntries.length ? 'annotation-anchor' : 'hover:bg-amber-50'}`}
+                                      aria-label={`${token.text}，${wordEntries.length}条词语注释`}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        setPendingAnchor({ id: token.id, type: 'word', preview: token.text });
+                                        dispatch({ type: 'selectSentence', chapterId: selectedChapter.id, sentenceId: sentence.id });
+                                        if (wordEntries[0]) dispatch({ type: 'selectAnnotation', annotationId: wordEntries[0].annotation.id });
+                                      }}
+                                    >
+                                      {token.text}
+                                    </button>
+                                    {wordEntries.length ? (
+                                      <FootnoteMarks
+                                        entries={wordEntries}
+                                        selectedId={workspace.selectedAnnotationId}
+                                        onSelect={jumpToAnnotation}
+                                      />
+                                    ) : null}
+                                  </span>
                                 );
                               })}
+                              <FootnoteMarks
+                                entries={sentenceAnchorEntries}
+                                selectedId={workspace.selectedAnnotationId}
+                                onSelect={jumpToAnnotation}
+                              />
                             </p>
                           )}
 
                           {mode === 'critical' ? (
-                            <div className="mt-3 grid gap-2 rounded-xl border border-blue-100 bg-blue-50/50 p-3 sm:grid-cols-2">
-                              {sentenceAnnotations.length ? sentenceAnnotations.map((annotation) => (
-                                <div key={annotation.id} className="critical-variant text-xs leading-5">
-                                  <div className="flex items-center gap-2">
-                                    <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">{kindLabel(annotation.kind)}</Chip>
-                                    <b>{annotation.source}</b>
-                                  </div>
-                                  <p className="mt-1 text-stone-700">{annotation.body}</p>
-                                </div>
-                              )) : <p className="text-xs text-stone-500">本句尚无来源异文或校记。</p>}
-                            </div>
-                          ) : null}
-
-                          {mode !== 'critical' && sentenceAnnotations.length ? (
-                            <div className="mt-3 flex flex-wrap items-center gap-2">
-                              {sentenceAnnotations.map((annotation, index) => (
-                                <button
-                                  key={annotation.id}
-                                  type="button"
-                                  className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11px] text-stone-600 hover:border-amber-400 hover:text-amber-800"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    dispatch({ type: 'selectAnnotation', annotationId: annotation.id });
-                                  }}
-                                >
-                                  [{index + 1}] {annotation.source} · {kindLabel(annotation.kind)}
-                                </button>
+                            <>
+                              {/* 校勘模式不显示角标，但保留跳转锚点，互见仍可落到本句 */}
+                              {sentenceEntries.map((entry) => (
+                                <span key={entry.annotation.id} id={`marker-${entry.annotation.id}`} className="sr-only" />
                               ))}
-                            </div>
+                              <div className="mt-3 grid gap-2 rounded-xl border border-blue-100 bg-blue-50/50 p-3 sm:grid-cols-2">
+                              {sentenceEntries.length ? sentenceEntries.map((entry) => {
+                                const annotation = entry.annotation;
+                                return (
+                                  <div
+                                    key={annotation.id}
+                                    data-footnote-id={annotation.id}
+                                    className="critical-variant text-xs leading-5"
+                                  >
+                                    <div className="flex items-center gap-2">
+                                      <span className="grid h-5 min-w-5 place-items-center rounded-full bg-amber-600 px-1 text-[10px] font-bold text-white">{entry.number}</span>
+                                      <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">{kindLabel(annotation.kind)}</Chip>
+                                      <b>{annotation.source}</b>
+                                    </div>
+                                    <p className="mt-1 text-stone-700">{annotation.body}</p>
+                                  </div>
+                                );
+                              }) : <p className="text-xs text-stone-500">本句尚无来源异文或校记。</p>}
+                              </div>
+                            </>
                           ) : null}
                         </div>
                         {mode === 'editing' ? (
@@ -917,6 +1220,59 @@ export function TextAnnotationWorkbench() {
               </div>
             </CardBody>
           </Card>
+
+          {chapterEntries.length || orphanEntries.length ? (
+            <Card
+              shadow="sm"
+              className={`mt-4 border border-stone-200 print-block ${mode === 'critical' ? 'border-red-200' : ''}`}
+            >
+              <CardHeader className="flex-col items-start gap-1 px-6 pb-2 pt-5 sm:flex-row sm:items-center">
+                <div>
+                  <h3 className="font-serif text-xl font-bold text-stone-900">
+                    {mode === 'critical' ? '无着注释' : '本章注释'}
+                    <span className="ml-2 text-sm font-normal text-stone-500">全局编号，按正文出现顺序</span>
+                  </h3>
+                </div>
+                <div className="text-xs text-stone-500 sm:ml-auto">
+                  {mode !== 'critical' && chapterEntries.length ? (
+                    <span>第 {chapterEntries[0].number}–{chapterEntries[chapterEntries.length - 1].number} 条</span>
+                  ) : null}
+                  {orphanEntries.length ? <span className="ml-2 text-red-600">无着注释 {orphanEntries.length} 条</span> : null}
+                </div>
+              </CardHeader>
+              <Divider />
+              <CardBody className="px-5 py-5 sm:px-9">
+                <ol className="mx-auto max-w-4xl space-y-3">
+                  {mode !== 'critical'
+                    ? chapterEntries.map((entry) => (
+                        <FootnoteItem
+                          key={entry.annotation.id}
+                          entry={entry}
+                          index={footnoteIndex}
+                          selected={workspace.selectedAnnotationId === entry.annotation.id}
+                          onSelect={() => dispatch({ type: 'selectAnnotation', annotationId: entry.annotation.id })}
+                          onJumpRef={jumpToAnnotation}
+                          onBack={() => jumpBackToAnchor(entry.annotation.id)}
+                        />
+                      ))
+                    : null}
+                  {orphanEntries.map((entry) => (
+                    <Fragment key={entry.annotation.id}>
+                      <span id={`marker-${entry.annotation.id}`} className="sr-only" />
+                      <FootnoteItem
+                        entry={entry}
+                        index={footnoteIndex}
+                        selected={workspace.selectedAnnotationId === entry.annotation.id}
+                        onSelect={() => dispatch({ type: 'selectAnnotation', annotationId: entry.annotation.id })}
+                        onJumpRef={jumpToAnnotation}
+                        onBack={null}
+                      />
+                    </Fragment>
+                  ))}
+                </ol>
+              </CardBody>
+            </Card>
+          ) : null}
         </section>
 
         <aside className="min-w-0 no-print">
@@ -958,10 +1314,12 @@ export function TextAnnotationWorkbench() {
                           key={annotation.id}
                           annotation={annotation}
                           document={document}
+                          index={footnoteIndex}
                           selected={selectedAnnotation?.id === annotation.id}
                           onSelect={() => dispatch({ type: 'selectAnnotation', annotationId: annotation.id })}
                           onUpdate={(patch) => updateAnnotation(annotation.id, patch)}
                           onDelete={() => deleteAnnotation(annotation.id)}
+                          onJumpRef={jumpToAnnotation}
                         />
                       )) : <p className="rounded-lg border border-dashed border-stone-300 p-4 text-center text-xs text-stone-500">尚未添加注释。选择词语可缩小注释范围。</p>}
                     </div>
@@ -972,7 +1330,7 @@ export function TextAnnotationWorkbench() {
                   <ScrollShadow className="max-h-[calc(100vh-210px)]">
                     <div className="space-y-4 pr-1">
                       <div className="rounded-xl bg-red-50 p-3 text-xs leading-5 text-red-800">
-                        系统按“相同引用目标 + 相同注释类型”识别来源冲突。可逐条保留、合并或标记解决，正文引用 ID 不变。
+                        系统按“相同引用目标 + 相同注释类型”识别来源冲突。可逐条保留、合并或标记解决；解决后全局脚注号自动按当前稿重算，正文与互见跳转不断链。
                       </div>
                       {conflicts.map((group) => (
                         <Card key={group.key} shadow="none" className="border border-red-100">

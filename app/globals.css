@@ -53,6 +53,54 @@ select {
   padding: 1px 3px;
 }
 
+.footnote-mark {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.15rem;
+  height: 1.15rem;
+  padding: 0 0.2rem;
+  border-radius: 9999px;
+  background: rgba(217, 119, 6, 0.12);
+  color: #b45309;
+  font-size: 0.62rem;
+  font-weight: 700;
+  line-height: 1;
+  vertical-align: baseline;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.footnote-mark:hover {
+  background: #d97706;
+  color: #fff;
+}
+
+.footnote-mark-active {
+  background: #d97706;
+  color: #fff;
+}
+
+.footnote-flash {
+  animation: footnote-flash 1.5s ease;
+}
+
+@keyframes footnote-flash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(217, 119, 6, 0.55);
+    background-color: rgba(253, 230, 138, 0.85);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(217, 119, 6, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(217, 119, 6, 0);
+    background-color: transparent;
+  }
+}
+
+.print-block {
+  display: block;
+}
+
 @media print {
   header,
   aside,
@@ -62,5 +110,10 @@ select {
 
   main {
     display: block !important;
+  }
+
+  .print-block {
+    display: block !important;
+    break-inside: avoid;
   }
 }
