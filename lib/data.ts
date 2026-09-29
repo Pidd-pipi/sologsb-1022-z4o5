@@ -99,7 +99,13 @@ function tokenId(chapter: number, sentenceIndex: number, index: number) {
 
 function findTokenId(sentenceId: string, text: string) {
   const target = chapters.flatMap((chapter) => chapter.sentences).find((item) => item.id === sentenceId);
-  return target?.tokens.find((token) => token.text.includes(text))?.id ?? target?.id ?? sentenceId;
+  // 优先精确包含；切不出单字合成词时回退到首个字，保证演示数据锚点不悬空
+  return (
+    target?.tokens.find((token) => token.text.includes(text))?.id ??
+    target?.tokens.find((token) => text.includes(token.text.trim()) && token.text.trim())?.id ??
+    target?.id ??
+    sentenceId
+  );
 }
 
 const pengId = findTokenId('sentence-1-3', '鹏');

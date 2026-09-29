@@ -201,7 +201,7 @@ export function collectSearchResults(document: TextDocument, query: string): Sea
   return results.slice(0, 24);
 }
 
-function findChapterIdForAnnotation(document: TextDocument, annotation: Annotation) {
+export function findChapterIdForAnnotation(document: TextDocument, annotation: Annotation) {
   if (annotation.anchorType === 'chapter') return annotation.anchorId;
   for (const chapter of document.chapters) {
     if (chapter.sentences.some((sentence) => sentence.id === annotation.anchorId)) return chapter.id;
